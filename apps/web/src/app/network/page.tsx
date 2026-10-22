@@ -30,9 +30,11 @@ import {
   AlertTriangle,
   CheckCircle2,
   Pencil,
+  RotateCw,
 } from "lucide-react";
 import Link from "next/link";
 import { ToolPageShell } from '@/components/tools/tool-page-shell';
+import { useAuth } from "@/lib/auth-context";
 import {
   getNetworkHistory,
   getNetworkStatus,
@@ -43,6 +45,9 @@ import {
   importNetworkProfile,
   exportNetworkProfile,
   verifyNetworkPassphrase,
+  replayHorizonRequest,
+  HorizonReplayKind,
+  HorizonReplayResult,
   NetworkChoice,
   NetworkHistoryBucket,
   NetworkHistoryResult,
@@ -60,6 +65,7 @@ const WINDOWS = [
 ];
 
 export default function NetworkStatusPage() {
+  const { user } = useAuth();
   const [network, setNetwork] = useState<NetworkChoice>("mainnet");
   const [windowMinutes, setWindowMinutes] = useState(60);
   const [status, setStatus] = useState<NetworkStatusResult | null>(null);
@@ -80,6 +86,11 @@ export default function NetworkStatusPage() {
   const [passphraseWarning, setPassphraseWarning] = useState("");
   const [profileError, setProfileError] = useState("");
   const [profileLoading, setProfileLoading] = useState(false);
+  const [replayKind, setReplayKind] = useState<HorizonReplayKind>("ledgers");
+  const [replayIdentifier, setReplayIdentifier] = useState("");
+  const [replayResult, setReplayResult] = useState<HorizonReplayResult | null>(null);
+  const [replayError, setReplayError] = useState("");
+  const [replayLoading, setReplayLoading] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,6 +235,25 @@ export default function NetworkStatusPage() {
     } catch (err) {
       console.error(err);
       setProfileError("Could not delete profile.");
+    }
+  }
+
+  async function handleReplay() {
+    setReplayError("");
+    setReplayResult(null);
+    setReplayLoading(true);
+    try {
+      const input = {
+        kind: replayKind,
+        ...(activeProfileId ? { profileId: activeProfileId } : { network }),
+        ...(replayKind === "account" ? { accountId: replayIdentifier.trim() } : {}),
+        ...(replayKind === "transaction" ? { transactionHash: replayIdentifier.trim() } : {}),
+      };
+      setReplayResult(await replayHorizonRequest(input));
+    } catch (err) {
+      setReplayError(err instanceof Error ? err.message : "Could not replay the Horizon request.");
+    } finally {
+      setReplayLoading(false);
     }
   }
 
@@ -519,6 +549,68 @@ export default function NetworkStatusPage() {
           </div>
         </div>
       )}
+
+      <section aria-labelledby="horizon-replay-heading" className="space-y-4 rounded-lg border bg-card p-5">
+        <div>
+          <h2 id="horizon-replay-heading" className="text-base font-semibold">Horizon request replay</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Replay a read-only request against the selected network or saved profile.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+            Request
+            <select
+              value={replayKind}
+              onChange={(event) => {
+                setReplayKind(event.target.value as HorizonReplayKind);
+                setReplayIdentifier("");
+              }}
+              className="min-w-44 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground"
+            >
+              <option value="ledgers">Latest ledgers</option>
+              <option value="fee_stats">Fee statistics</option>
+              <option value="account">Account details</option>
+              <option value="transaction">Transaction details</option>
+            </select>
+          </label>
+          {(replayKind === "account" || replayKind === "transaction") && (
+            <label className="flex min-w-64 flex-1 flex-col gap-1 text-xs font-medium text-muted-foreground">
+              {replayKind === "account" ? "Account public key" : "Transaction hash"}
+              <input
+                value={replayIdentifier}
+                onChange={(event) => setReplayIdentifier(event.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={replayKind === "account" ? "G..." : "64-character hash"}
+                className="rounded-md border border-border bg-background px-3 py-2 font-mono text-sm text-foreground"
+              />
+            </label>
+          )}
+          <button
+            type="button"
+            onClick={() => void handleReplay()}
+            disabled={!user || replayLoading || ((replayKind === "account" || replayKind === "transaction") && !replayIdentifier.trim())}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            title={user ? "Replay this read-only request" : "Sign in to replay Horizon requests"}
+          >
+            <RotateCw className={`h-4 w-4 ${replayLoading ? "animate-spin" : ""}`} />
+            {replayLoading ? "Replaying" : "Replay request"}
+          </button>
+        </div>
+        {!user && <p className="text-xs text-muted-foreground">Sign in to replay Horizon requests.</p>}
+        {replayError && <p role="alert" className="text-sm text-destructive">{replayError}</p>}
+        {replayResult && (
+          <div aria-live="polite" className="space-y-2 border-t border-border pt-4">
+            <p className="text-xs text-muted-foreground">
+              GET {replayResult.path} · {replayResult.status} {replayResult.statusText} · {replayResult.latencyMs} ms
+            </p>
+            <pre className="max-h-96 overflow-auto rounded-md bg-muted/40 p-3 text-xs">
+              {JSON.stringify(replayResult.body, null, 2)}
+            </pre>
+          </div>
+        )}
+      </section>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         <MetricCard

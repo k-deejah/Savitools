@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  BadGatewayException,
   Injectable,
   OnModuleInit,
   OnModuleDestroy,
@@ -12,6 +13,7 @@ import { InjectRepository } from "@nestjs/typeorm";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { Between, LessThan, Repository } from "typeorm";
 import { MetricsService } from "../metrics/metrics.service";
+import { assertSafeDestination } from "../../common/ssrf-guard";
 import { NetworkSample } from "./entities/network-sample.entity";
 import { NetworkProfile } from "./entities/network-profile.entity";
 
@@ -67,9 +69,52 @@ export interface NetworkHistoryResponse {
   samples: NetworkHistoryBucket[];
 }
 
+export interface HorizonReplayInput {
+  kind: "ledgers" | "fee_stats" | "account" | "transaction";
+  network?: "mainnet" | "testnet";
+  profileId?: string;
+  accountId?: string;
+  transactionHash?: string;
+  limit?: number;
+}
+
+export interface HorizonReplayResult {
+  path: string;
+  status: number;
+  statusText: string;
+  latencyMs: number;
+  body: unknown;
+}
+
 const MAX_HISTORY_SAMPLES = 20_000;
 const HISTORY_CACHE_TTL_MS = 15_000;
 const MAX_HISTORY_CACHE_ENTRIES = 100;
+const MAX_REPLAY_RESPONSE_BYTES = 1_000_000;
+
+async function readBoundedResponse(response: Response): Promise<string> {
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_REPLAY_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new BadGatewayException("Horizon response exceeds the 1 MB replay limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
 
 @Injectable()
 export class NetworkService implements OnModuleInit, OnModuleDestroy {
@@ -377,6 +422,111 @@ export class NetworkService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`Error fetching status for ${networkLabel}`, error);
       throw error;
     }
+  }
+
+  async replayHorizonRequest(
+    userId: string,
+    input: HorizonReplayInput,
+  ): Promise<HorizonReplayResult> {
+    let baseUrl: string;
+    if (input.profileId) {
+      const profile = await this.networkProfileRepository.findOne({
+        where: { id: input.profileId, ownerId: userId },
+      });
+      if (!profile) throw new NotFoundException("Network profile not found");
+      baseUrl = profile.horizonUrl;
+    } else {
+      if (input.network !== "mainnet" && input.network !== "testnet") {
+        throw new BadRequestException("A valid network or saved profile is required");
+      }
+      baseUrl = this.horizonUrl(input.network);
+    }
+
+    let resourcePath: string;
+    switch (input.kind) {
+      case "ledgers": {
+        const limit = input.limit ?? 10;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 20) {
+          throw new BadRequestException("Ledger limit must be between 1 and 20");
+        }
+        resourcePath = `/ledgers?order=desc&limit=${limit}`;
+        break;
+      }
+      case "fee_stats":
+        resourcePath = "/fee_stats";
+        break;
+      case "account":
+        if (!input.accountId || !/^G[A-Z2-7]{55}$/.test(input.accountId)) {
+          throw new BadRequestException("A valid Stellar account ID is required");
+        }
+        resourcePath = `/accounts/${encodeURIComponent(input.accountId)}`;
+        break;
+      case "transaction":
+        if (!input.transactionHash || !/^[a-fA-F0-9]{64}$/.test(input.transactionHash)) {
+          throw new BadRequestException("A 64-character transaction hash is required");
+        }
+        resourcePath = `/transactions/${input.transactionHash}`;
+        break;
+      default:
+        throw new BadRequestException("Unsupported Horizon request type");
+    }
+
+    let parsedBase: URL;
+    try {
+      parsedBase = new URL(baseUrl);
+    } catch {
+      throw new BadRequestException("Invalid Horizon profile URL");
+    }
+    if (
+      (parsedBase.protocol !== "https:" && parsedBase.protocol !== "http:") ||
+      parsedBase.username || parsedBase.password || parsedBase.search || parsedBase.hash
+    ) {
+      throw new BadRequestException("Invalid Horizon profile URL");
+    }
+
+    const basePath = parsedBase.pathname.replace(/\/+$/, "");
+    const requestUrl = new URL(`${basePath}${resourcePath}`, parsedBase.origin);
+    await assertSafeDestination(requestUrl, [parsedBase.origin]);
+
+    const startedAt = Date.now();
+    let response: Response;
+    try {
+      response = await fetch(requestUrl, {
+        method: "GET",
+        headers: { accept: "application/hal+json, application/json" },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch {
+      throw new BadGatewayException("Horizon request failed or timed out");
+    }
+    const contentLength = Number(response.headers.get("content-length") ?? 0);
+    if (contentLength > MAX_REPLAY_RESPONSE_BYTES) {
+      throw new BadGatewayException("Horizon response exceeds the 1 MB replay limit");
+    }
+
+    let text: string;
+    try {
+      text = await readBoundedResponse(response);
+    } catch (error) {
+      if (error instanceof BadGatewayException) throw error;
+      throw new BadGatewayException("Could not read Horizon response");
+    }
+
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text.slice(0, 20_000);
+    }
+
+    return {
+      path: `${requestUrl.pathname}${requestUrl.search}`,
+      status: response.status,
+      statusText: response.statusText,
+      latencyMs: Date.now() - startedAt,
+      body,
+    };
   }
 
   async pollAndStore() {

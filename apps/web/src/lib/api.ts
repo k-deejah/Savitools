@@ -627,6 +627,32 @@ export interface NetworkPassphraseVerificationResult {
   actualPassphrase: string;
 }
 
+export type HorizonReplayKind = "ledgers" | "fee_stats" | "account" | "transaction";
+
+export interface HorizonReplayInput {
+  kind: HorizonReplayKind;
+  network?: NetworkChoice;
+  profileId?: string;
+  accountId?: string;
+  transactionHash?: string;
+  limit?: number;
+}
+
+export interface HorizonReplayResult {
+  path: string;
+  status: number;
+  statusText: string;
+  latencyMs: number;
+  body: unknown;
+}
+
+export async function replayHorizonRequest(input: HorizonReplayInput) {
+  return apiFetch<HorizonReplayResult>("/network/replay", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function listNetworkProfiles() {
   return apiFetch<NetworkProfile[]>("/network/profiles");
 }

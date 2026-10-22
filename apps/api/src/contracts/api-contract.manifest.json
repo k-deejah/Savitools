@@ -368,6 +368,11 @@
       "auth": "public"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/network/replay",
+      "auth": "jwt"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/network/status",
       "auth": "public"

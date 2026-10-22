@@ -32,6 +32,7 @@ import {
   apiFetch,
   fetchWebhookHistory,
   refreshSession,
+  replayHorizonRequest,
   sendWebhook,
 } from '@/lib/api';
 import { buildTransaction, fetchOperations } from '@/lib/composer-api';
@@ -428,6 +429,13 @@ const SMOKE_CONTRACTS: readonly SmokeContract[] = [
       }),
     method: 'POST',
     path: '/v1/composer/build',
+  },
+  {
+    flow: 'Horizon request replay',
+    wrapper: 'replayHorizonRequest() in lib/api.ts',
+    invoke: () => replayHorizonRequest({ kind: 'fee_stats', network: 'testnet' }),
+    method: 'POST',
+    path: '/v1/network/replay',
   },
   {
     flow: 'Monitor watches',

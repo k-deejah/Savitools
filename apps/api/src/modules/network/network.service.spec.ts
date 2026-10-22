@@ -1,7 +1,15 @@
 import { BadRequestException } from "@nestjs/common";
+import type { ConfigService } from "@nestjs/config";
 import { Between, LessThan } from "typeorm";
+import type { Repository } from "typeorm";
+import { NetworkProfile } from "./entities/network-profile.entity";
 import { NetworkSample } from "./entities/network-sample.entity";
 import { NetworkService } from "./network.service";
+import { assertSafeDestination } from "../../common/ssrf-guard";
+
+jest.mock("../../common/ssrf-guard", () => ({
+  assertSafeDestination: jest.fn().mockResolvedValue(undefined),
+}));
 
 describe("NetworkService", () => {
   let service: NetworkService;
@@ -10,6 +18,9 @@ describe("NetworkService", () => {
     save: jest.Mock;
     find: jest.Mock;
     delete: jest.Mock;
+  };
+  let networkProfileRepository: {
+    findOne: jest.Mock;
   };
 
   beforeEach(() => {
@@ -21,26 +32,23 @@ describe("NetworkService", () => {
       find: jest.fn(),
       delete: jest.fn(),
     };
+    networkProfileRepository = {
+      findOne: jest.fn(),
+    };
 
     service = new NetworkService(
       {
         get: jest.fn((key: string, fallback?: string) => fallback),
-      } as any,
-      repository as any,
-      {
-        create: jest.fn(),
-        save: jest.fn(),
-        find: jest.fn(),
-        findOne: jest.fn(),
-        update: jest.fn(),
-        remove: jest.fn(),
-      } as any,
+      } as unknown as ConfigService,
+      repository as unknown as Repository<NetworkSample>,
+      networkProfileRepository as unknown as Repository<NetworkProfile>,
     );
   });
 
   afterEach(() => {
-    if ((service as any).pollInterval) {
-      clearInterval((service as any).pollInterval);
+    const pollInterval = (service as unknown as { pollInterval?: NodeJS.Timeout }).pollInterval;
+    if (pollInterval) {
+      clearInterval(pollInterval);
     }
   });
 
@@ -116,7 +124,7 @@ describe("NetworkService", () => {
     });
 
     it("does not queue overlapping sampler runs", async () => {
-      (service as any).pollInProgress = true;
+      (service as unknown as { pollInProgress: boolean }).pollInProgress = true;
 
       await service.pollAndStore();
 
@@ -246,10 +254,9 @@ describe("NetworkService", () => {
 
   describe("verifyNetworkPassphrase", () => {
     it("returns match true when passphrases match", async () => {
-      jest.spyOn(global, "fetch").mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ network_passphrase: "Public Global Stellar Network ; September 2015" }),
-      } as any);
+      jest.spyOn(global, "fetch").mockResolvedValueOnce(
+        new Response(JSON.stringify({ network_passphrase: "Public Global Stellar Network ; September 2015" })),
+      );
 
       const result = await service.verifyNetworkPassphrase(
         "https://horizon.stellar.org",
@@ -262,10 +269,9 @@ describe("NetworkService", () => {
     });
 
     it("returns match false when passphrases mismatch", async () => {
-      jest.spyOn(global, "fetch").mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ network_passphrase: "Test SDF Network ; September 2015" }),
-      } as any);
+      jest.spyOn(global, "fetch").mockResolvedValueOnce(
+        new Response(JSON.stringify({ network_passphrase: "Test SDF Network ; September 2015" })),
+      );
 
       const result = await service.verifyNetworkPassphrase(
         "https://horizon.stellar.org",
@@ -275,6 +281,88 @@ describe("NetworkService", () => {
         match: false,
         actualPassphrase: "Test SDF Network ; September 2015",
       });
+    });
+  });
+
+  describe("replayHorizonRequest", () => {
+    it("replays an allowlisted built-in GET and returns its response metadata", async () => {
+      const fetchMock = jest
+        .spyOn(global, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify({ records: [] })));
+
+      await expect(
+        service.replayHorizonRequest("user-1", {
+          kind: "ledgers",
+          network: "mainnet",
+          limit: 5,
+        }),
+      ).resolves.toMatchObject({
+        path: "/ledgers?order=desc&limit=5",
+        status: 200,
+        body: { records: [] },
+      });
+
+      const [requestUrl, requestOptions] = fetchMock.mock.calls[0];
+      expect(requestUrl.toString()).toBe(
+        "https://horizon.stellar.org/ledgers?order=desc&limit=5",
+      );
+      expect(requestOptions).toEqual(
+        expect.objectContaining({ method: "GET", redirect: "manual" }),
+      );
+      expect(assertSafeDestination).toHaveBeenCalledWith(
+        expect.objectContaining({ pathname: "/ledgers" }),
+        ["https://horizon.stellar.org"],
+      );
+    });
+
+    it("rejects invalid resource identifiers and oversized results", async () => {
+      const fetchMock = jest.spyOn(global, "fetch");
+
+      await expect(
+        service.replayHorizonRequest("user-1", {
+          kind: "account",
+          network: "testnet",
+          accountId: "not-an-account",
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      fetchMock.mockResolvedValueOnce(
+        new Response("{}", {
+          headers: { "content-length": "1000001" },
+        }),
+      );
+      await expect(
+        service.replayHorizonRequest("user-1", {
+          kind: "fee_stats",
+          network: "testnet",
+        }),
+      ).rejects.toThrow(/1 MB replay limit/);
+    });
+
+    it("uses only network profiles owned by the caller", async () => {
+      networkProfileRepository.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.replayHorizonRequest("user-1", {
+          kind: "fee_stats",
+          profileId: "another-users-profile",
+        }),
+      ).rejects.toThrow("Network profile not found");
+      expect(networkProfileRepository.findOne).toHaveBeenCalledWith({
+        where: { id: "another-users-profile", ownerId: "user-1" },
+      });
+    });
+
+    it("returns a gateway error when Horizon cannot be reached", async () => {
+      jest.spyOn(global, "fetch").mockRejectedValueOnce(new Error("connection failed"));
+
+      await expect(
+        service.replayHorizonRequest("user-1", {
+          kind: "fee_stats",
+          network: "mainnet",
+        }),
+      ).rejects.toThrow("Horizon request failed or timed out");
     });
   });
 

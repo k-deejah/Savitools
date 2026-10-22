@@ -547,6 +547,15 @@ export const toolDocs: ToolDocs[] = [
           'Watch the base-fee history chart for congestion trends over the last hour.',
         ],
       },
+      {
+        title: 'Replay a Horizon request',
+        steps: [
+          'Sign in, then select the built-in network or one of your saved network profiles.',
+          'Choose Latest ledgers, Fee statistics, Account details, or Transaction details. Enter a public account ID or transaction hash when requested.',
+          'Click Replay request to issue the same read-only Horizon GET again and inspect its status, latency, and response body.',
+          'Replay is limited to those read-only resources and response bodies up to 1 MB.',
+        ],
+      },
     ],
     troubleshooting: [
       {

@@ -1,6 +1,7 @@
-import { Controller, Get, Query, Post, Body, Param, Put, Delete, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Get, Query, Post, Body, Param, Put, Delete, HttpCode, HttpStatus, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiTags, ApiResponse } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { NetworkService } from './network.service';
 
 @ApiTags('network')
@@ -30,6 +31,20 @@ export class NetworkController {
   ) {
     const net = network === 'testnet' ? 'testnet' : 'mainnet';
     return this.networkService.getHistory(net, from, to);
+  }
+
+  @Post('replay')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Replay a safe, read-only Horizon request' })
+  @ApiResponse({ status: 200, description: 'Horizon response replayed' })
+  @ApiResponse({ status: 400, description: 'Invalid resource or request parameters' })
+  @ApiResponse({ status: 404, description: 'Saved network profile not found' })
+  async replayHorizonRequest(
+    @CurrentUser() user: { id: string },
+    @Body() body: Parameters<NetworkService['replayHorizonRequest']>[1],
+  ) {
+    return this.networkService.replayHorizonRequest(user.id, body);
   }
 
   @Get('profiles')
