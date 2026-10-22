@@ -1,6 +1,9 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import * as StellarSdk from '@stellar/stellar-sdk';
+import axios, { AxiosRequestConfig } from 'axios';
 import { CSV_BOM, toCsv } from '../../common/csv';
 import { decodeOperation, DecodedOperation } from './operation-decoder';
 import { explainOpCode, explainTxCode } from './result-codes';
@@ -12,6 +15,8 @@ import {
   groupSorobanEventsByContract,
   parseSorobanEventsFromMeta,
 } from './event-parser';
+import { HorizonReplay } from './entities/horizon-replay.entity';
+import { ReplayHorizonRequestDto } from './dto/replay-horizon-request.dto';
 
 export interface DecodedEffect {
   type: string;
@@ -79,7 +84,11 @@ export interface ComposerPayload {
 export class InspectorService {
   private readonly logger = new Logger(InspectorService.name);
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    @InjectRepository(HorizonReplay)
+    private readonly horizonReplayRepo: Repository<HorizonReplay>,
+  ) {}
 
   private horizon(network: 'testnet' | 'mainnet') {
     const url =
@@ -378,6 +387,136 @@ export class InspectorService {
       network,
       composerPayload: this.buildComposerPayload(null, xdrOps, network, innerTx),
     };
+  }
+
+  // ─── POST /inspector/replay ───────────────────────────────────────────────
+
+  async replayHorizonRequest(
+    dto: ReplayHorizonRequestDto,
+    userId: string,
+    workspaceId: string,
+  ): Promise<{ replay: HorizonReplay; response: any }> {
+    const { method, endpoint, params, network, transactionHash, requestId } = dto;
+
+    const baseUrl =
+      network === 'mainnet'
+        ? this.config.get<string>('STELLAR_HORIZON_MAINNET_URL', 'https://horizon.stellar.org')
+        : this.config.get<string>('STELLAR_HORIZON_URL', 'https://horizon-testnet.stellar.org');
+
+    const url = `${baseUrl}${endpoint}`;
+    const startTime = Date.now();
+
+    let response: any;
+    let statusCode: number;
+    let errorMessage: string | null = null;
+
+    try {
+      const config: AxiosRequestConfig = {
+        method: method.toUpperCase(),
+        url,
+        params,
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000,
+      };
+
+      const axiosResponse = await axios(config);
+      response = axiosResponse.data;
+      statusCode = axiosResponse.status;
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err)) {
+        statusCode = err.response?.status ?? 500;
+        response = err.response?.data ?? null;
+        errorMessage = err.message;
+      } else {
+        statusCode = 500;
+        response = null;
+        errorMessage = err instanceof Error ? err.message : String(err);
+      }
+      this.logger.warn(`Replay request failed: ${errorMessage}`);
+    }
+
+    const endTime = Date.now();
+    const responseTime = endTime - startTime;
+
+    // Save replay history
+    const replay = this.horizonReplayRepo.create({
+      userId,
+      workspaceId,
+      method,
+      endpoint,
+      params,
+      response,
+      statusCode,
+      responseTime,
+      network,
+      transactionHash,
+      requestId,
+      errorMessage,
+    });
+
+    await this.horizonReplayRepo.save(replay);
+
+    return { replay, response };
+  }
+
+  // ─── GET /inspector/replay/history ────────────────────────────────────────
+
+  async getReplayHistory(
+    userId: string,
+    workspaceId: string,
+    options: {
+      limit?: number;
+      offset?: number;
+      network?: 'testnet' | 'mainnet';
+      transactionHash?: string;
+      requestId?: string;
+    } = {},
+  ): Promise<{ replays: HorizonReplay[]; total: number }> {
+    const { limit = 50, offset = 0, network, transactionHash, requestId } = options;
+
+    const queryBuilder = this.horizonReplayRepo
+      .createQueryBuilder('replay')
+      .where('replay.userId = :userId', { userId })
+      .andWhere('replay.workspaceId = :workspaceId', { workspaceId });
+
+    if (network) {
+      queryBuilder.andWhere('replay.network = :network', { network });
+    }
+
+    if (transactionHash) {
+      queryBuilder.andWhere('replay.transactionHash = :transactionHash', { transactionHash });
+    }
+
+    if (requestId) {
+      queryBuilder.andWhere('replay.requestId = :requestId', { requestId });
+    }
+
+    queryBuilder
+      .orderBy('replay.createdAt', 'DESC')
+      .skip(offset)
+      .take(Math.min(limit, 100));
+
+    const [replays, total] = await queryBuilder.getManyAndCount();
+
+    return { replays, total };
+  }
+
+  // ─── DELETE /inspector/replay/:id ──────────────────────────────────────────
+
+  async deleteReplayHistory(
+    replayId: string,
+    userId: string,
+    workspaceId: string,
+  ): Promise<void> {
+    const result = await this.horizonReplayRepo.delete({
+      id: replayId,
+      userId,
+      workspaceId,
+    });
+
+    if (result.affected === 0) {
+      throw new NotFoundException(`Replay record ${replayId} not found`);
+    }
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
